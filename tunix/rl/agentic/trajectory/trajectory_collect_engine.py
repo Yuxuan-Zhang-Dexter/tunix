@@ -21,6 +21,7 @@ multi-pair trajectory collection.
 """
 
 import asyncio
+import functools
 import time
 from typing import Any, AsyncGenerator, Callable, Concatenate, Dict, List, Optional, ParamSpec, Set, Tuple
 
@@ -405,6 +406,9 @@ class TrajectoryCollectEngine:
           contains_generation_msg=True,
       )
       self.agent.trajectory.prompt_tokens = prompt_tokens
+      # Seed the TITO accumulator. Inert no-op when ``enable_tito`` is False.
+      if hasattr(self.agent, "append_init_tokens"):
+        self.agent.append_init_tokens(np.asarray(prompt_tokens, dtype=np.int32))
 
     self._start_ts = time.perf_counter()
     self._response_token_count = 0
@@ -452,13 +456,34 @@ class TrajectoryCollectEngine:
     if self._check_and_set_context_limit_reached():
       return True
 
-    rollout_output = await asyncio.get_event_loop().run_in_executor(
-        None,
-        self.model_call,
-        self.agent.chat_completions,
-        self.env,
-        **self.model_call_kwargs,
+    # TITO branch: when the agent has a populated token accumulator, feed
+    # vLLM the pre-tokenized prompt instead of letting downstream layers
+    # apply_chat_template + re-tokenize. This is the byte-equality path
+    # that closes G1/G3/G4 of `tasks/tito_tio_integration/plan.md`.
+    use_tito = (
+        getattr(self.agent, "enable_tito", False)
+        and bool(getattr(self.agent, "_token_history", None))
     )
+    if use_tito:
+      token_prompt = self.agent.token_prompt_for_next_turn
+      bound_call = functools.partial(
+          self.model_call,
+          None,  # chat_lists not used in TITO mode
+          self.env,
+          prompt_token_ids=[token_prompt],
+          **self.model_call_kwargs,
+      )
+      rollout_output = await asyncio.get_event_loop().run_in_executor(
+          None, bound_call
+      )
+    else:
+      rollout_output = await asyncio.get_event_loop().run_in_executor(
+          None,
+          self.model_call,
+          self.agent.chat_completions,
+          self.env,
+          **self.model_call_kwargs,
+      )
     if rollout_output.tokens:
       self._response_token_count += len(rollout_output.tokens[0])
     if self._check_and_set_context_limit_reached():
@@ -500,6 +525,13 @@ class TrajectoryCollectEngine:
       if assistant_message:
         cur_step.assistant_tokens = rollout_output.tokens[0]
         cur_step.assistant_masks = np.ones_like(rollout_output.tokens[0])
+        # TITO accumulator: append wrapped assistant content (no-op if
+        # enable_tito=False).
+        if hasattr(self.agent, "append_assistant_response"):
+          self.agent.append_assistant_response(
+              rollout_output.tokens[0],
+              rollout_output.logprobs[0] if rollout_output.logprobs else None,
+          )
 
       # Environment tokens/masks
       # Terminal-step environment messages are not appended to the response
@@ -515,6 +547,9 @@ class TrajectoryCollectEngine:
         cur_step.env_tokens = np.array(e_tokens)
         cur_step.env_masks = np.array(e_masks)
         self._response_token_count += len(e_tokens)
+        # TITO accumulator: append env tokens verbatim.
+        if hasattr(self.agent, "append_env_observation_tokens"):
+          self.agent.append_env_observation_tokens(np.array(e_tokens))
 
     if step_timed_out:
       self.agent.trajectory.status = agent_types.TrajectoryStatus.TIMEOUT
